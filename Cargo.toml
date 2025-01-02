@@ -11,3 +11,4 @@ tokio = { version = "1.0", features = ["full"] }
 error-chain = "0.12"
 log = "0.4"
 env_logger = "0.10"
+futures = "0.3"
