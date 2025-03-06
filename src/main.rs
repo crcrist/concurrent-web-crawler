@@ -1,13 +1,14 @@
+use error_chain::error_chain;
+use futures::future::join_all;
+use reqwest::Client;
+use scraper::{Html, Selector};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
-use error_chain::error_chain;
-use scraper::{Html, Selector};
+use std::time::Duration;
+use tokio::sync::{mpsc, Semaphore};
 use url::Url;
-use futures::future::join_all;  // Add this import
 
-
-// error chain macro, custom error type to handle a variety of different errors
+// Custom error type to handle different errors
 error_chain! {
     foreign_links {
         ReqError(reqwest::Error);
@@ -17,7 +18,7 @@ error_chain! {
     }
 }
 
-// represents a single webpage
+// Page struct representing a single webpage
 #[derive(Debug, Clone)]
 struct Page {
     url: String,
@@ -25,229 +26,353 @@ struct Page {
     depth: u32,
 }
 
-// control center of the program 
-// arc mutex allows for the concurrency
-// arc = ensure data isnt accidentally deleted 
-// mutex = make sure only one part of our program can modify data at a time
+// Configuration for crawler behavior
+#[derive(Debug, Clone)]
+struct CrawlerConfig {
+    max_depth: u32,
+    concurrent_tasks: usize,
+    request_timeout: Duration,
+    crawl_timeout: Duration,
+    delay_between_requests: Duration,
+    user_agent: String,
+    respect_robots_txt: bool,
+}
+
+impl Default for CrawlerConfig {
+    fn default() -> Self {
+        Self {
+            max_depth: 2,
+            concurrent_tasks: 4,
+            request_timeout: Duration::from_secs(10),
+            crawl_timeout: Duration::from_secs(60),
+            delay_between_requests: Duration::from_millis(100),
+            user_agent: "RustCrawler/1.0".to_string(),
+            respect_robots_txt: true,
+        }
+    }
+}
+
+// Crawler struct - control center of the program
 #[derive(Clone)]
 struct Crawler {
     visited: Arc<Mutex<HashSet<String>>>,
     graph: Arc<Mutex<HashMap<String, Vec<String>>>>,
-    max_depth: u32,
-    concurrent_tasks: usize,
+    config: CrawlerConfig,
+    client: Client,
+    limiter: Arc<Semaphore>,
 }
 
-// constructor function - intializing tools
-// empty hashset for tracking visited pages
-// empty hashmap for building out graph (connections between visted places)
-// paramaeters - how deep to explore
 impl Crawler {
-    fn new(max_depth: u32, concurrent_tasks: usize) -> Self {
-        Crawler {
+    // Constructor with configurable parameters
+    fn new(config: CrawlerConfig) -> Result<Self> {
+        // Create a custom client with proper settings
+        let client = Client::builder()
+            .user_agent(&config.user_agent)
+            .timeout(config.request_timeout)
+            .build()?;
+
+        // Store the concurrent_tasks value before moving config
+        let concurrent_tasks = config.concurrent_tasks;
+
+        Ok(Crawler {
             visited: Arc::new(Mutex::new(HashSet::new())),
             graph: Arc::new(Mutex::new(HashMap::new())),
-            max_depth,
-            concurrent_tasks,
-        }
+            config,
+            client,
+            limiter: Arc::new(Semaphore::new(concurrent_tasks)),
+        })
     }
-    
-    // implement producer-consumer pattern
-    // tx (transmitter) - put new URLs we find (producer)
-    // rx (receiver) - worker threads pick up URLs to process (consumers)
-    // parameter 100 - can hold 100 links
+
+    // Main crawl method implementing producer-consumer pattern
     async fn crawl(&self, start_url: &str) -> Result<()> {
         println!("\n🚀 Starting crawler at: {}", start_url);
-        
-        let (tx, rx) = mpsc::channel(100);
-        let rx = Arc::new(Mutex::new(rx));
 
-        // create the starting point, this is our root page of depth 0
+        // Create a channel for communication between workers
+        let (tx, mut rx) = mpsc::channel(100);
+
+        // Create the starting point
         let start = Page {
             url: start_url.to_string(),
             links: Vec::new(),
             depth: 0,
         };
+
+        // Mark the start URL as visited right away
+        {
+            let mut visited = self.visited.lock().unwrap();
+            visited.insert(start_url.to_string());
+        }
+
         tx.send(start).await.unwrap();
 
-        // setting up worker thrads, concurrent_tasks determins number of workers
-        // each worker has: 
-        // - copy of crawler 
-        // - transmitter (to report new urls)
-        // - access to the shared receiver (get new assignments)
+        // Set up worker tasks to process URLs
         let mut handles = vec![];
-        for worker_id in 0..self.concurrent_tasks {
-            let crawler = self.clone();
-            let tx = tx.clone();
-            let rx = Arc::clone(&rx);
-            
-            // locks the receiver, tries to get a new page to process, 
-            // if no new pages then print goodbye and exit
-            // match statement works similarly to if/else, but accounts for all cases
-            let handle = tokio::spawn(async move {
-                loop {
-                    let page = {
-                        let mut rx = rx.lock().unwrap();
-                        match rx.try_recv() {
-                            Ok(page) => page,
-                            Err(_) => {
-                                println!("👋 Worker {} exiting - no more pages to process", worker_id);
-                                break;
-                            }
-                        }
-                    };
-                    
-                    // depth check happens here - "bounded depth traversal"
-                    if page.depth >= crawler.max_depth {
-                        println!("🛑 Worker {} - Reached max depth ({}) for {}", 
-                            worker_id, crawler.max_depth, page.url);
+
+        // Main processing loop
+        loop {
+            match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                // We received a page to process
+                Ok(Some(page)) => {
+                    // Skip if we've reached max depth
+                    if page.depth >= self.config.max_depth {
+                        println!(
+                            "🛑 Reached max depth ({}) for {}",
+                            self.config.max_depth, page.url
+                        );
                         continue;
                     }
 
-                    println!("\n📊 Worker {} processing {} at depth {}/{}", 
-                        worker_id, page.url, page.depth, crawler.max_depth);
-                    
-                    // the heart of the crawler
-                    // calling process_page to fetch and analyze a page
-                    // if successful
-                    // - updates the graph with new links
-                    // - for each link
-                    // -- Create new page with increased depth
-                    // -- sends it to the channel for other workers to process
-                    // - errors are logges and crawler continues
-                    // the use of locks (lock().unwrap() is crucial
-                    // - prevents race condition
-                    match crawler.process_page(&page.url).await {
-                        Ok(links) => {
+                    // Clone what we need for the task
+                    let crawler = self.clone();
+                    let tx = tx.clone();
+
+                    // Spawn a new task to process this page
+                    let handle = tokio::spawn(async move {
+                        // Acquire a permit from the semaphore to limit concurrency
+                        let _permit = crawler.limiter.acquire().await.unwrap();
+
+                        println!(
+                            "\n📊 Processing {} at depth {}/{}",
+                            page.url, page.depth, crawler.config.max_depth
+                        );
+
+                        // Process the page and handle any links found
+                        match crawler.process_page(&page.url).await {
+                            Ok(links) => {
+                                // Update the graph with new links
                                 {
                                     let mut graph = crawler.graph.lock().unwrap();
-                                    graph.insert(page.url.clone(), links.clone());   
+                                    graph.insert(page.url.clone(), links.clone());
                                 }
 
-                            for link in links {
-                                let new_page = Page {
-                                    url: link.clone(),
-                                    links: Vec::new(),
-                                    depth: page.depth + 1,
-                                };
-                                println!("➡️  Worker {} queueing {} (at depth {})", 
-                                    worker_id, link, new_page.depth);
-                                if tx.send(new_page).await.is_err() {
-                                    println!("❌ Worker {} - Channel closed, exiting", worker_id);
-                                    break;
+                                // Queue up new pages for processing
+                                for link in links {
+                                    // Check if we've already visited this URL
+                                    let should_queue = {
+                                        let mut visited = crawler.visited.lock().unwrap();
+                                        if !visited.contains(&link) {
+                                            // Mark as visited preemptively
+                                            visited.insert(link.clone());
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    };
+
+                                    if should_queue {
+                                        let new_page = Page {
+                                            url: link.clone(),
+                                            links: Vec::new(),
+                                            depth: page.depth + 1,
+                                        };
+
+                                        println!(
+                                            "➡️  Queueing {} (at depth {})",
+                                            link, new_page.depth
+                                        );
+
+                                        if tx.send(new_page).await.is_err() {
+                                            println!("❌ Channel closed, exiting");
+                                            break;
+                                        }
+                                    }
                                 }
                             }
+                            Err(e) => println!("⚠️  Error processing {}: {}", page.url, e),
                         }
-                        Err(e) => println!("⚠️  Error processing {}: {}", page.url, e),
+
+                        // Delay to be polite to servers
+                        tokio::time::sleep(crawler.config.delay_between_requests).await;
+
+                        Ok::<(), Error>(())
+                    });
+
+                    handles.push(handle);
+
+                    // Clean up completed handles
+                    handles.retain(|h| !h.is_finished());
+                }
+                // Channel is empty for now, but might get more messages later
+                Ok(None) => {
+                    // If all tasks are done and channel is empty, we're finished
+                    if handles.is_empty() {
+                        break;
+                    }
+
+                    // Otherwise wait for tasks to complete
+                    if let Some(handle) = join_all(handles.iter_mut()).await.pop() {
+                        if let Err(e) = handle {
+                            println!("⚠️  A worker task failed: {}", e);
+                        }
                     }
                 }
-                Ok::<(), Error>(())
-            });
-            handles.push(handle);
+                // Timeout reached while waiting for new messages
+                Err(_) => {
+                    // Check if any tasks are still running
+                    if handles.is_empty() {
+                        break;
+                    }
+
+                    // Clean up completed handles again
+                    handles.retain(|h| !h.is_finished());
+                }
+            }
         }
 
-        // Drop the original sender
-        // shutdown of the crawler - stating "no new tasks will be created" 
-        drop(tx);
-
-        // Set a timeout for the entire crawl operation 
-        let timeout = tokio::time::Duration::from_secs(60);  // 1 minute timeout
-        // join_all(handles) is waiting for all workers to return, to ensure no lost progress
-        match tokio::time::timeout(timeout, join_all(handles)).await {
+        // Set a timeout for the entire crawl operation
+        match tokio::time::timeout(self.config.crawl_timeout, join_all(handles)).await {
             Ok(results) => {
                 for result in results {
-                    result??;
+                    if let Err(e) = result {
+                        println!("⚠️  A worker task failed: {}", e);
+                    }
                 }
                 println!("\n✅ Crawl completed successfully!");
             }
-            Err(_) => println!("\n⚠️  Crawl timed out after {} seconds!", timeout.as_secs()),
+            Err(_) => println!(
+                "\n⚠️  Crawl timed out after {} seconds!",
+                self.config.crawl_timeout.as_secs()
+            ),
         }
 
         // Print final statistics
-        let visited = self.visited.lock().unwrap();
-        let graph = self.graph.lock().unwrap();
-        println!("\n📊 Final Statistics:");
-        println!("   Pages crawled: {}", visited.len());
-        println!("   Total links found: {}", graph.values().map(|v| v.len()).sum::<usize>());
+        self.print_statistics().await;
 
         Ok(())
     }
 
-    // before requesting, make sure we have not seen the URL already
-    // block seperated to release the lock ASAP - "minimal critical section"
+    // Process a single page - fetch and extract links
     async fn process_page(&self, url: &str) -> Result<Vec<String>> {
-        {
-            let visited = self.visited.lock().unwrap();
-            if visited.contains(url) {
-                println!("🔄 Already visited {}, skipping", url);
-                return Ok(Vec::new());
-            }
+        println!(
+            "\n📄 Crawling page: {} (Total visited: {})",
+            url,
+            self.visited.lock().unwrap().len()
+        );
+
+        // Make an HTTP request with our configured client
+        let response = self.client.get(url).send().await?;
+
+        // Check for successful response
+        if !response.status().is_success() {
+            println!(
+                "⚠️  Failed to download page: {} (status: {})",
+                url,
+                response.status()
+            );
+            return Ok(Vec::new());
         }
 
-        // after confirming URL as new, mark as visited
-        // the 100 seconds delay is to prevent overwhelming web servers
-        // - Robots Exclusion Protocol (robots.txt)
-        {
-            let mut visited = self.visited.lock().unwrap();
-            visited.insert(url.to_string());
-        }
+        println!(
+            "⬇️  Downloaded page: {} (status: {})",
+            url,
+            response.status()
+        );
 
-        // Add a small delay to be polite to the server
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        
-        println!("\n📄 Crawling page: {} (Total visited: {})", 
-                url, 
-                self.visited.lock().unwrap().len());
-        
-        // make an HTTP request
-        // parse the HTML document
-        // use CSS selectors to find links 
-        // await? is combining two modern Rust features
-        // - async/await (for handling operations without blocking)
-        // - the ? operator (for elegant error handling)
-        let response = reqwest::get(url).await?;
-        println!("⬇️  Downloaded page: {} (status: {})", url, response.status());
         let text = response.text().await?;
-        
+
+        // Parse HTML and extract links
         let document = Html::parse_document(&text);
         let selector = Selector::parse("a[href]").unwrap();
         let base_url = Url::parse(url)?;
-        
-        // extracting and validating links
-        // - convert relative URLs to absolute ones (using base URL as context)
-        // - only accept HTTP(S) links (ignore mailto:links)
-        // - handle malformed URLs gracefully
+
+        // Extract and validate links
         let mut links = Vec::new();
         println!("🔍 Found links:");
+
         for element in document.select(&selector) {
             if let Some(href) = element.value().attr("href") {
+                // Convert relative URLs to absolute
                 if let Ok(absolute_url) = base_url.join(href) {
+                    // Only accept HTTP(S) links
                     if absolute_url.scheme() == "http" || absolute_url.scheme() == "https" {
-                        println!("  → {}", absolute_url);
-                        links.push(absolute_url.to_string());
+                        // Normalize the URL to avoid duplicates
+                        let normalized_url = self.normalize_url(&absolute_url);
+
+                        println!("  → {}", normalized_url);
+                        links.push(normalized_url);
                     }
                 }
             }
         }
-        println!("✨ Found {} links on this page", links.len());
+
+        println!("✨ Found {} valid links on this page", links.len());
         Ok(links)
+    }
+
+    // Normalize URLs to prevent duplicates (removing trailing slashes, fragments, etc.)
+    fn normalize_url(&self, url: &Url) -> String {
+        let mut url = url.clone();
+
+        // Remove fragments (anchors)
+        url.set_fragment(None);
+
+        // Remove query parameters if needed
+        // url.set_query(None);
+
+        // Convert to string and remove trailing slash if present
+        let mut url_str = url.to_string();
+        if url_str.ends_with('/') {
+            url_str.pop();
+        }
+
+        url_str
+    }
+
+    // Print statistics about the crawl
+    async fn print_statistics(&self) {
+        let visited = self.visited.lock().unwrap();
+        let graph = self.graph.lock().unwrap();
+
+        let total_links = graph.values().map(|v| v.len()).sum::<usize>();
+        let avg_links_per_page = if !graph.is_empty() {
+            total_links as f64 / graph.len() as f64
+        } else {
+            0.0
+        };
+
+        println!("\n📊 Final Statistics:");
+        println!("   Pages crawled: {}", visited.len());
+        println!("   Total links found: {}", total_links);
+        println!("   Average links per page: {:.2}", avg_links_per_page);
+
+        // Find page with most outgoing links
+        if let Some((url, links)) = graph.iter().max_by_key(|(_, links)| links.len()) {
+            println!("   Most linked page: {} with {} links", url, links.len());
+        }
     }
 }
 
-// telling Rust to set up an asynch runtime
 #[tokio::main]
 async fn main() -> Result<()> {
-    // sets up logging 
+    // Initialize logger
     env_logger::init();
-    
-    let max_depth = 2;  // Reduced depth for clearer output
-    let concurrent_tasks = 4;
-    let crawler = Crawler::new(max_depth, concurrent_tasks);
-    println!("\n🚀 Starting crawler:");
-    println!("   Max depth: {}", max_depth);
-    println!("   Concurrent tasks: {}", concurrent_tasks);
-    
+
+    // Configure the crawler
+    let config = CrawlerConfig {
+        max_depth: 2,
+        concurrent_tasks: 8,
+        request_timeout: Duration::from_secs(10),
+        crawl_timeout: Duration::from_secs(120),
+        delay_between_requests: Duration::from_millis(100),
+        user_agent: "RustCrawler/1.0 (https://example.com/bot)".to_string(),
+        respect_robots_txt: true,
+    };
+
+    println!("\n🚀 Starting crawler with configuration:");
+    println!("   Max depth: {}", config.max_depth);
+    println!("   Concurrent tasks: {}", config.concurrent_tasks);
+    println!(
+        "   Request timeout: {} seconds",
+        config.request_timeout.as_secs()
+    );
+    println!(
+        "   Crawl timeout: {} seconds",
+        config.crawl_timeout.as_secs()
+    );
+
+    let crawler = Crawler::new(config)?;
     crawler.crawl("https://www.rust-lang.org").await?;
-    
-    // signifies completion, () is unit type, like returning void, but explicit
+
     Ok(())
 }
+
