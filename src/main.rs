@@ -67,6 +67,13 @@ struct Args {
     /// Verbosity level (0-3)
     #[arg(short, long, default_value = "1")]
     verbose: u8,
+
+    // Add these new command line options to the Args struct
+    #[arg(long, default_value = "300")]
+    max_viz_nodes: usize,
+
+    #[arg(long, default_value = "10")]
+    max_links_per_node: usize,
 }
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -135,21 +142,17 @@ async fn main() -> Result<()> {
         info!("Results saved to: {}", output_file);
     }
 
-    // Generate visualizations if requested
-    if let Some(dot_path) = args.dot_output {
-        let mut visualizer = visualization::GraphVisualizer::new();
-        visualizer.build_from_crawler_graph(&result.graph);
-        visualizer.export_dot(&dot_path)?;
-        info!("Graph visualization exported to DOT format: {}", dot_path);
-    }
-
+    // Then replace the HTML visualization section in main function with:
     if let Some(html_path) = args.html_output {
         let mut visualizer = visualization::GraphVisualizer::new();
         visualizer.build_from_crawler_graph(&result.graph);
-        visualizer.export_html(&html_path)?;
+        visualizer.export_html_optimized(
+            &html_path,
+            args.max_viz_nodes,
+            args.max_links_per_node,
+        )?;
         info!("Interactive visualization exported to HTML: {}", html_path);
     }
-
     Ok(())
 }
 
